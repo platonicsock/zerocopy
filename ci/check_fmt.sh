@@ -9,26 +9,19 @@
 # those terms.
 
 set -eo pipefail
+cd "$(dirname "$0")/.."
 
 if [[ "$1" == "--fix" ]]; then
-    FMT_FLAGS=""
+    FMT_FLAGS=()
 else
-    FMT_FLAGS="--check"
+    FMT_FLAGS=("--check")
 fi
 
-find . -iname '*.rs' -type f       \
-    -not -path './anneal/*'        \
-    -not -path './target/*'        \
-    -not -path './tools/target/*'  \
-    -not -iname '*.expected.rs'    \
-    -not -path './vendor/*'        \
-    -not -path './tools/vendor/*'  \
-    -print0 | xargs -0 --no-run-if-empty ./cargo.sh +nightly fmt $FMT_FLAGS -- >&2
+NIGHTLY="$(zerocopy/cargo.sh --version nightly)"
 
-find ./anneal -iname '*.rs' -type f        \
-    -not -path './anneal/target/*'         \
-    -not -path './anneal/vendor/*'         \
-    -not -path './anneal/v2/vendor/*'      \
-    -not -path './anneal/tests/fixtures/*' \
-    -not -path './anneal/tests/ui/*'       \
-    -print0 | xargs -0 --no-run-if-empty ./cargo.sh +nightly fmt $FMT_FLAGS --manifest-path anneal/Cargo.toml -- >&2
+zerocopy/ci/check_fmt.sh "$@"
+
+cargo +"$NIGHTLY" fmt --manifest-path tools/Cargo.toml --all "${FMT_FLAGS[@]}" >&2
+cargo +"$NIGHTLY" fmt --manifest-path anneal/Cargo.toml --all "${FMT_FLAGS[@]}" >&2
+cargo +"$NIGHTLY" fmt --manifest-path anneal/v1/Cargo.toml --all "${FMT_FLAGS[@]}" >&2
+cargo +"$NIGHTLY" fmt --manifest-path exocrate/Cargo.toml "${FMT_FLAGS[@]}" >&2

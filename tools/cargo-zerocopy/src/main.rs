@@ -267,7 +267,7 @@ fn install_targets_or_exit(version: &str, targets: &[String]) -> Result<(), Erro
 fn get_rustflags(name: &str) -> String {
     // See #1792 for context on zerocopy_derive_union_into_bytes.
     let mut flags =
-        "--cfg zerocopy_unstable_derive_on_error --cfg zerocopy_derive_union_into_bytes --cfg __ZEROCOPY_INTERNAL_USE_ONLY_DEV_MODE"
+        "--cfg zerocopy_unstable_linux --cfg zerocopy_derive_union_into_bytes --cfg __ZEROCOPY_INTERNAL_USE_ONLY_DEV_MODE"
             .to_string();
     flags += &format!(" --cfg __ZEROCOPY_INTERNAL_USE_ONLY_TOOLCHAIN=\"{name}\"");
 
@@ -361,6 +361,10 @@ fn delegate_cargo() -> Result<(), Error> {
                     .filter_map(|(k, v)| if k == "RUSTFLAGS" { Some(v) } else { None })
                     .next()
                     .unwrap_or_default();
+                let env_rustdocflags = env::vars()
+                    .filter_map(|(k, v)| if k == "RUSTDOCFLAGS" { Some(v) } else { None })
+                    .next()
+                    .unwrap_or_default();
 
                 let rustflags = format!(
                     "{} {} {}",
@@ -368,11 +372,13 @@ fn delegate_cargo() -> Result<(), Error> {
                     get_toolchain_rustflags(name),
                     env_rustflags,
                 );
+                let rustdocflags = format!("{rustflags} {env_rustdocflags}");
 
-                // Pass RUSTFLAGS to both Rust (via `RUSTFLAGS`) and Rustdoc
-                // (via `RUSTDOCFLAGS`).
+                // Rustdoc needs the wrapper's cfgs and the caller's RUSTFLAGS
+                // in addition to any rustdoc-specific flags supplied through
+                // RUSTDOCFLAGS.
                 let mut cmd = rustup(["run", version, "cargo"], Some(("RUSTFLAGS", &rustflags)));
-                cmd.env("RUSTDOCFLAGS", &rustflags);
+                cmd.env("RUSTDOCFLAGS", &rustdocflags);
 
                 if env::var("CARGO_TARGET_DIR").is_ok() {
                     eprintln!("[cargo-zerocopy] WARNING: `CARGO_TARGET_DIR` is set - this may cause `cargo-zerocopy` to behave unexpectedly");
@@ -382,11 +388,6 @@ fn delegate_cargo() -> Result<(), Error> {
 
                 // Computes the fully-qualified package name of workspace package `p`.
                 let fqpn = |p| {
-                    // Generate a lockfile, if absent.
-                    // This is a prerequisite of running pkgid.
-                    let _ = rustup(["run", version, "cargo", "generate-lockfile"], None)
-                        .output_or_exit();
-
                     let output = rustup(["run", version, "cargo", "pkgid", "-p"], None)
                         .arg(p)
                         .output_or_exit();

@@ -9,6 +9,7 @@
 # those terms.
 
 set -e
+cd "$(dirname "$0")/.."
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 <version>" >&2
@@ -19,14 +20,16 @@ VERSION="$1"
 
 # Update the package version in the Anneal crate's manifest. This is the
 # authoritative version for the crate.
-sed -i -e "s/^version = \"[0-9a-zA-Z\.-]*\"/version = \"$VERSION\"/" anneal/Cargo.toml
+sed -i -e "s/^version = \"[0-9a-zA-Z\.-]*\"/version = \"$VERSION\"/" anneal/v1/Cargo.toml
 
 # Update the installation instructions in the README to reflect the new version.
 # This ensures that users copying instructions get the latest version.
-sed -i -e "s/cargo install cargo-anneal@[0-9a-zA-Z\.-]*/cargo install cargo-anneal@$VERSION/" anneal/README.md
+sed -i -e "s/cargo install cargo-anneal@[0-9a-zA-Z\.-]*/cargo install cargo-anneal@$VERSION/" anneal/v1/README.md
 
 # Update Cargo.lock to reflect the version change in Cargo.toml. We must run
-# this in the anneal subdirectory because it is a separate workspace with its
-# own lockfile.
-cd anneal
-cargo generate-lockfile
+# this in the anneal/v1 subdirectory because it is a separate workspace with its
+# own lockfile. Use `cargo update` on the local package itself instead of
+# regenerating the entire lockfile; the release version bump should not also
+# roll dependency versions.
+cd anneal/v1
+cargo update -p cargo-anneal --precise "$VERSION"

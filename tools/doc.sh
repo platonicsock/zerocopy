@@ -12,9 +12,10 @@
 
 set -eo pipefail
 
-./cargo.sh +nightly rustdoc -- \
+cd "$(dirname "$0")/.."
+
+./zerocopy/cargo.sh +nightly rustdoc -- \
     -Z unstable-options \
     --extend-css rustdoc/style.css
 #    --document-hidden-items \
 #    --document-private-items \
-

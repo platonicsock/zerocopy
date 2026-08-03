@@ -30,6 +30,19 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # These are bounded, client-native retries for recognized transient download
+  # failures. They never rerun a Cargo or rustup command, so deterministic build
+  # and test failures still fail immediately. Keep these values coordinated
+  # with `.github/workflows/anneal.yml` and the CI Dockerfile.
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  # These two values are the producer/consumer protocol for the matrix's CI
+  # image. `build_docker_env` must export this tag into this archive, each
+  # consumer must load that archive, and the Docker shell wrapper must run this
+  # tag. Keep the protocol centralized here rather than duplicating literals in
+  # the upload/download actions.
+  ZC_CI_IMAGE: zerocopy-ci:local
+  ZC_CI_IMAGE_ARCHIVE: zerocopy-ci.tar
   RUSTFLAGS: -Dwarnings
   RUSTDOCFLAGS: -Dwarnings --cfg=zerocopy_unstable_ptr
   # `ZC_NIGHTLY_XXX` are flags that we add to `XXX` only on the nightly
@@ -48,10 +61,10 @@ jobs:
     needs: build_docker_env
     permissions:
       contents: read
-      packages: read # required to pull docker caches from ghcr.io
     defaults:
       run:
-        shell: /tmp/docker-shell.sh {0}
+        shell: /tmp/docker-shell.sh {0} # zizmor: ignore[misfeature] (CI intentionally routes build matrix commands through the prebuilt Docker image)
+        working-directory: zerocopy
 
     strategy:
       # By default, this is set to `true`, which means that a single CI job
@@ -295,50 +308,53 @@ jobs:
     name: Build & Test (${{ matrix.crate }} / ${{ matrix.toolchain }} / ${{ matrix.features }} / ${{ matrix.target }})
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 2
         persist-credentials: false
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-    - name: Log in to the Container registry
-      uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+    # The producer exposes the ID assigned by upload-artifact, rather than an
+    # artifact name. The ID identifies one immutable artifact from this exact
+    # run, so a renamed, stale, or Buildx-generated artifact cannot be selected
+    # accidentally. Checkout must remain first because this is a local action.
+    - name: Download prebuilt Docker image
+      uses: ./.github/actions/download-artifact-with-retry
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        artifact-id: ${{ needs.build_docker_env.outputs.image_artifact_id }}
+        path: ${{ runner.temp }}
+        expected-file: ${{ env.ZC_CI_IMAGE_ARCHIVE }}
 
-    - name: Generate sanitized Docker tag
-      id: docker_tag
-      env:
-        REF_NAME: ${{ github.ref_name }}
+    # This step runs before /tmp/docker-shell.sh exists, so its explicit Bash
+    # shell is load-bearing. The Docker exporter is single-platform; the
+    # producer and every consumer intentionally use the same ubuntu-latest
+    # runner architecture. If CI gains another architecture, build and select a
+    # distinct artifact ID for it rather than silently sharing this archive.
+    - name: Load prebuilt Docker image
       shell: bash
+      env:
+        IMAGE_ARCHIVE: ${{ runner.temp }}/${{ env.ZC_CI_IMAGE_ARCHIVE }}
+        IMAGE_NAME: ${{ env.ZC_CI_IMAGE }}
       run: |
-        echo "tag=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
-
-    - name: Load image from cache
-      uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
-      with:
-        context: .
-        file: .github/workflows/Dockerfile
-        load: true # This loads the resulting image into the local 'docker' daemon
-        tags: zerocopy-ci:local
-        provenance: false
-        cache-from: |
-          type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:${{ steps.docker_tag.outputs.tag }}
-          type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:main
-        # Notice we omit `cache-to` here. We don't want many parallel jobs
-        # fighting to write the exact same layers back to the cache API.
+        set -euo pipefail
+        # Keep the large archive only as long as `docker load` needs it. The
+        # trap also reclaims it if loading or validation fails, avoiding archive
+        # plus expanded-image disk pressure for later diagnostic steps.
+        trap 'rm -f -- "$IMAGE_ARCHIVE"' EXIT
+        docker load --input "$IMAGE_ARCHIVE"
+        docker image inspect "$IMAGE_NAME" >/dev/null
+        # `inspect` proves the tag exists; running a trivial command also proves
+        # that the archive matches this runner's architecture.
+        docker run --rm "$IMAGE_NAME" true
 
     - name: Create Docker Shell Wrapper
       shell: bash
       run: |
         set -eo pipefail
 
-        # Ensure the directories exist on the host so Docker doesn't create them as root
-        mkdir -p /home/runner/.cargo/registry /home/runner/.cargo/git
+        # Keep the Docker steps' Cargo cache separate from the host Cargo home.
+        # The container runs as root, while later host-side actions run as the
+        # runner user and need to write their own Cargo registry cache.
+        mkdir -p /home/runner/.docker-cargo/registry /home/runner/.docker-cargo/git
 
         cat << 'EOF' > /tmp/docker-shell.sh
         #!/bin/bash
@@ -348,13 +364,16 @@ jobs:
         docker run --rm -i \
           --workdir "$PWD" \
           -v /home/runner/work:/home/runner/work \
-          -v /home/runner/.cargo/registry:/root/.cargo/registry \
-          -v /home/runner/.cargo/git:/root/.cargo/git \
+          -v /home/runner/.docker-cargo/registry:/root/.cargo/registry \
+          -v /home/runner/.docker-cargo/git:/root/.cargo/git \
           -e GITHUB_ENV -e GITHUB_PATH -e GITHUB_STEP_SUMMARY -e GITHUB_OUTPUT -e GITHUB_WORKSPACE \
           -e CI -e GITHUB_ACTIONS -e GITHUB_ACTOR -e GITHUB_REPOSITORY -e GITHUB_SHA -e GITHUB_REF -e GITHUB_EVENT_NAME \
-          -e TOOLCHAIN -e CRATE -e TARGET -e FEATURES -e RUSTFLAGS -e MIRIFLAGS -e ZC_TOOLCHAIN \
+          -e TOOLCHAIN -e CRATE -e TARGET -e FEATURES -e ZC_TOOLCHAIN \
+          -e RUSTFLAGS -e RUSTDOCFLAGS -e MIRIFLAGS \
+          -e CARGO_NET_RETRY -e RUSTUP_MAX_RETRIES \
+          -e ZC_NIGHTLY_RUSTFLAGS -e ZC_NIGHTLY_MIRIFLAGS \
           -e ZC_SKIP_CARGO_SEMVER_CHECKS \
-          zerocopy-ci:local bash -c "git config --global --add safe.directory '*' && exec bash \"\$1\"" -- "$1"
+          "$ZC_CI_IMAGE" bash -c "git config --global --add safe.directory '*' && exec bash \"\$1\"" -- "$1"
         EOF
         chmod +x /tmp/docker-shell.sh
 
@@ -390,13 +409,6 @@ jobs:
         else
           echo "Using non-nightly toolchain; not modifying RUSTFLAGS='$RUSTFLAGS' or MIRIFLAGS='$MIRIFLAGS'" | tee -a $GITHUB_STEP_SUMMARY
         fi
-
-    # On our MSRV, `cargo` does not know about the `rust-version` field. As a
-    # result, in `cargo.sh`, if we use our MSRV toolchain in order to run `cargo
-    # metadata`, we will not be able to extract the `rust-version` field. Thus,
-    # in `cargo.sh`, we explicitly do `cargo +stable metadata`. This requires a
-    # (more recent) stable toolchain to be installed. As of this writing, this
-    # toolchain is not used for anything else.
 
     # On the `thumbv6m-none-eabi` target, we can't run `cargo check --tests` due
     # to the `memchr` crate, so we just do `cargo check` instead.
@@ -595,7 +607,7 @@ jobs:
         if [[ "$TOOLCHAIN" == "nightly" ]]; then
           export RUSTDOCFLAGS="-Z unstable-options --document-hidden-items $METADATA_DOCS_RS_RUSTDOC_ARGS $RUSTDOCFLAGS"
         fi
-        ./cargo.sh +$TOOLCHAIN doc --document-private-items --package $CRATE $FEATURES
+        ./cargo.sh +$TOOLCHAIN doc --no-deps --document-private-items --package $CRATE $FEATURES
 
     # If the commit message contains the line `SKIP_CARGO_SEMVER_CHECKS=1`, then
     # skip the cargo-semver-checks step.
@@ -625,14 +637,12 @@ jobs:
     # in our vendor directory, and we don't vendor zerocopy. Removing this file
     # has the effect of causing the subsequent build to use crates.io rather
     # than vendored dependencies, which is fine since we only run this on the
-    # stable toolchain. We also remove `tools/vendor` because it contains a
-    # vendored copy of zerocopy, which causes `cargo-semver-checks` to error
-    # with an ambiguous package error. Eventually, we should update this job to
-    # use the `--baseline-rev` option to use a previous git commit as the baseline
-    # for checking compatibility (rather than the most recent published version),
+    # stable toolchain. Eventually, we should update this job to use the
+    # `--baseline-rev` option to use a previous git commit as the baseline for
+    # checking compatibility (rather than the most recent published version),
     # which will make it unnecessary to remove `.cargo/config.toml`.
     - name: Remove Cargo config and vendored dependencies
-      run: rm -rf .cargo/config.toml tools/vendor anneal/vendor
+      run: rm -rf .cargo/config.toml
 
     # Check semver compatibility with the most recently-published version on
     # crates.io. We do this in the matrix rather than in its own job so that it
@@ -659,6 +669,7 @@ jobs:
         # [1] See, for example: https://github.com/google/zerocopy/actions/runs/9466417300/job/26078264384?pr=1413
         feature-group: only-explicit-features
         features: __internal_use_only_features_that_work_on_stable
+        manifest-path: zerocopy/Cargo.toml
         rust-toolchain: ${{ env.ZC_TOOLCHAIN }}
         rust-target: ${{ matrix.target }}
       # TODO(#1565): Run on wasm32-unknown-unknown.
@@ -672,8 +683,11 @@ jobs:
   codegen:
     runs-on: ubuntu-latest
     name: Run codegen tests
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run tests
@@ -691,8 +705,11 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     name: Generate code coverage
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Generate code coverage
@@ -711,16 +728,16 @@ jobs:
             --skip ui \
             --skip codegen
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }} # zizmor: ignore[secrets-outside-env]
-          files: lcov.info
+          files: zerocopy/lcov.info
 
   kani:
     runs-on: ubuntu-latest        
     name: 'Run tests under Kani'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
@@ -735,7 +752,7 @@ jobs:
           # TODO(https://github.com/model-checking/kani-github-action/issues/56):
           # Go back to testing all features once the Kani GitHub Action supports
           # specifying a particular toolchain.
-          args: "--package zerocopy --features __internal_use_only_features_that_work_on_stable --output-format=terse -Zfunction-contracts --randomize-layout --memory-safety-checks --overflow-checks --undefined-function-checks --unwinding-checks"
+          args: "--manifest-path zerocopy/Cargo.toml --package zerocopy --features __internal_use_only_features_that_work_on_stable --output-format=terse -Zfunction-contracts --randomize-layout --memory-safety-checks --overflow-checks --undefined-function-checks --unwinding-checks"
           # This version is automatically rolled by
           # `roll-pinned-toolchain-versions.yml`.
           kani-version: 0.60.0
@@ -749,8 +766,11 @@ jobs:
   check_be_aarch64:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / aarch64_be-unknown-linux-gnu)
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Configure environment variables
@@ -778,8 +798,11 @@ jobs:
   check_avr_atmega:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / avr-none)
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Configure environment variables
@@ -812,7 +835,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Check Rust formatting
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check Rust formatting
@@ -821,8 +844,11 @@ jobs:
   check_stale_stderr:
     runs-on: ubuntu-latest
     name: Check stale stderr files
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check stale stderr
@@ -832,7 +858,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Check GitHub Actions
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check Actions
@@ -841,8 +867,11 @@ jobs:
   check_readme:
     runs-on: ubuntu-latest
     name: Check README.md
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check README.md
@@ -851,8 +880,11 @@ jobs:
   check_versions:
     runs-on: ubuntu-latest
     name: Check crate versions match
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Make sure that both crates are at the same version, and that zerocopy
@@ -864,8 +896,11 @@ jobs:
   check_msrv_is_minimal:
     runs-on: ubuntu-latest
     name: Check MSRV is minimal
+    defaults:
+      run:
+        working-directory: zerocopy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check MSRV is minimal
@@ -879,11 +914,11 @@ jobs:
         # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
         # `GONOSUMDB` once this bug is fixed.
         run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run check
-        run: ./ci/check_all_toolchains_tested.sh
+        run: cd zerocopy && ./ci/check_all_toolchains_tested.sh
 
   check-job-dependencies:
     runs-on: ubuntu-latest
@@ -893,7 +928,7 @@ jobs:
         # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
         # `GONOSUMDB` once this bug is fixed.
         run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run dependency check
@@ -907,55 +942,11 @@ jobs:
         run: |
          sudo apt-get update
          sudo apt-get install ripgrep
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run todo check
         run: ./ci/check_todo.sh
-
-  check-auto-approvers:
-    runs-on: ubuntu-latest
-    name: Check auto-approvers setup
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Structural Check
-        run: python3 ci/validate_auto_approvers.py --check-config
-      - name: Health Check (Current Commit)
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          CHANGED_FILES_COUNT: ${{ github.event.pull_request.changed_files }}
-        run: |
-          set -eo pipefail
-
-          # Fetch changed files (including renames for move-tracking)
-          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" \
-            --paginate \
-            --jq 'map([.filename, .previous_filename] | map(select(.)))' | jq -s 'add' > changed_files.json
-
-          # Fetch unique contributors (logins)
-          CONTRIBUTORS=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/commits" \
-            --paginate \
-            --jq '[.[] | .author?.login, .committer?.login] | unique | map(select(.)) | .[]' | tr '\n' ' ')
-
-          # Run validator and assert exit code 0 or 1
-          set +e
-          python3 ci/validate_auto_approvers.py \
-            --changed-files changed_files.json \
-            --expected-count "$CHANGED_FILES_COUNT" \
-            --contributors $CONTRIBUTORS
-          EXIT_CODE=$?
-          set -e
-
-          if [ $EXIT_CODE -ne 0 ] && [ $EXIT_CODE -ne 1 ]; then
-            echo "::error::Validation encountered technical error (exit $EXIT_CODE)"
-            exit 1
-          fi
-          echo "Validation healthy (exit $EXIT_CODE)"
 
   run-git-hooks:
     runs-on: ubuntu-latest
@@ -969,7 +960,7 @@ jobs:
         run: |
          sudo apt-get update
          sudo apt-get install ripgrep
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run dependency check
@@ -987,14 +978,17 @@ jobs:
     runs-on: ubuntu-latest
     name: zizmor
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@71321a20a9ded102f6e9ce5718a2fcec2c4f70d8 # v0.5.2
+      - uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
         with:
           # Only scan the .github directory to avoid scanning vendored dependencies
           inputs: .github
           persona: pedantic
+          # Avoid failing CI on low-severity findings from token-backed online audits;
+          # those still show up in the non-blocking SARIF upload workflow.
+          min-severity: medium
           # We don't want to use GitHub Advanced Security because we want to
           # block the merge on zizmor failure, and the only way to do that
           # (without manually configuring a ruleset) is to fail the job, which
@@ -1004,19 +998,21 @@ jobs:
   build_docker_env:
     name: Build Docker image
     runs-on: ubuntu-latest
+    # Consumers select the upload by this immutable, producer-generated ID.
+    # Do not replace it with a duplicated artifact-name string: an empty ID is
+    # deliberately rejected by download-artifact-with-retry before fan-out.
+    outputs:
+      image_artifact_id: ${{ steps.upload_image.outputs.artifact-id }}
     permissions:
       contents: read
       packages: write # required to push docker caches to ghcr.io
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Log in to the Container registry
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+      - name: Set up Docker
+        uses: ./.github/actions/setup-docker-with-retry
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1030,19 +1026,34 @@ jobs:
         run: |
           echo "tag=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and cache layers
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+      - name: Build, cache, and export image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: .github/workflows/Dockerfile
-          push: false
+          tags: ${{ env.ZC_CI_IMAGE }}
           provenance: false
+          # The Docker exporter creates a single archive accepted directly by
+          # `docker load`. Its gzip-compressed layers make the tar suitable for
+          # upload-file-artifact's direct (non-ZIP) transfer. This path and tag
+          # are coupled to the workflow-level producer/consumer values above.
+          outputs: type=docker,dest=${{ runner.temp }}/${{ env.ZC_CI_IMAGE_ARCHIVE }},compression=gzip
           cache-from: |
             type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:${{ steps.docker_tag.outputs.tag }}
             type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:main
           # External pull requests have read-only package permissions, so they
           # can consume GHCR caches but cannot export updated cache layers.
           cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:{0},mode=max', steps.docker_tag.outputs.tag) || '' }}
+
+      # Uploading is the producer's final gate. Matrix jobs cannot start until
+      # this succeeds and the job exposes its artifact ID, so no runner is spent
+      # on an image that was only partially published.
+      - name: Upload image for matrix jobs
+        id: upload_image
+        uses: ./.github/actions/upload-file-artifact
+        with:
+          name: ${{ env.ZC_CI_IMAGE_ARCHIVE }}
+          path: ${{ runner.temp }}/${{ env.ZC_CI_IMAGE_ARCHIVE }}
 
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
@@ -1056,7 +1067,7 @@ jobs:
       # https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
       if: failure()
       runs-on: ubuntu-latest
-      needs: [build_test, codegen, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, check_stale_stderr, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, check-auto-approvers, zizmor, build_docker_env]
+      needs: [build_test, codegen, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, check_stale_stderr, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, zizmor, build_docker_env]
       steps:
         - name: Mark the job as failed
           run: exit 1

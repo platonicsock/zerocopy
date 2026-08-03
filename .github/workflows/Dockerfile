@@ -8,6 +8,13 @@
 
 FROM ubuntu:24.04
 
+# These are the same bounded, download-only retry counts configured in
+# `ci.yml`. Defining them before the first networked build step covers rustup
+# and Cargo operations while the image is built; the workflow-level values
+# cover host operations and are forwarded into containers at runtime.
+ENV CARGO_NET_RETRY=10 \
+    RUSTUP_MAX_RETRIES=10
+
 # Use `DEBIAN_FRONTEND=noninteractive` to prevent timezone prompts.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gcc-multilib    \
@@ -37,11 +44,12 @@ RUN cargo install cargo-nextest --locked                    && \
 
 WORKDIR /setup
 
-COPY Cargo.toml ./
-COPY cargo.sh   ./
-COPY tools      ./tools
+COPY zerocopy/Cargo.toml ./zerocopy/Cargo.toml
+COPY zerocopy/cargo.sh   ./zerocopy/cargo.sh
+COPY tools              ./tools
 
 ENV CARGO_ZEROCOPY_AUTO_INSTALL_TOOLCHAIN=1
+WORKDIR /setup/zerocopy
 RUN ./cargo.sh +stable --version  && \
     ./cargo.sh +nightly --version && \
     ./cargo.sh +msrv --version    && \
